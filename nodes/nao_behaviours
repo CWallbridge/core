@@ -18,6 +18,17 @@ import motion
 import numpy
 import math
 import random
+import time
+import sys
+import os
+
+import underworlds
+import underworlds.server
+from underworlds.tools.loader import ModelLoader
+from underworlds.tools.spatial_relations import *
+from underworlds.tools.edit import *
+
+from placement_description import *
 
 TO_RAD = math.pi / 180
 
@@ -41,9 +52,20 @@ is_tracking_focus = False
 robot_ready_to_point = False
 
 last_pose = None
+state = "idle"
 
-state = "waiting"
-childname = ""
+#cur_map = 0
+ctx = underworlds.Context("Nao Description")
+
+target = numpy.empty((2,7), dtype="a36")
+na_desc = [[]]
+
+order = 0
+cond1 = "N"
+cond2 = "A"
+cur_targ = 0
+cur_map = 0
+new_desc = True
 
 def clamp(v, limits):
     vmin, vmax = limits
@@ -65,21 +87,20 @@ def xyz2pantilt(pose, headframe=HEAD_FRAME):
 
     return (pan,tilt)
 
-def look_at(pose):
-    if trackerProxy.isActive():
-        trackerProxy.stopTracker()
-    yaw, pitch = xyz2pantilt(pose)
-    yaw = clamp(yaw, (-2.0857, 2.0857))
-    pitch = clamp(-pitch, (-0.6720, 0.5149)) #beware the '-pitch'!
+def look_at(targetpose):
 
-    if abs(yaw) < 0.01 and abs(pitch) < 0.01:
-       return
+    reference_frame = "torso"
+    try:
+        targetpose.header.stamp = tl.getLatestCommonTime(targetpose.header.frame_id,reference_frame)
+        pose = tl.transformPose(reference_frame, targetpose)
+        target = [pose.pose.position.x,pose.pose.position.y,pose.pose.position.z]
+    except:
+        print "error poses"
+        return
+        
+    trackerProxy.post.lookAt(target, 0, .3, False)
 
-    joints = ['HeadYaw','HeadPitch']
-    #motionProxy.angleInterpolationWithSpeed(joints, [yaw, pitch], 0.1) # blocking
-    speed = 0.1 if abs(yaw) > 0.1 else max(0.005, abs(yaw)) # adapt the speed to the distance to move
-    rospy.logdebug("Moving head by: pan: %s, tilt: %s at %s%% of speed" % (yaw, pitch, speed * 100))
-    motionProxy.changeAngles(joints, [yaw, pitch], speed) # non-blocking
+    return
 
 
 def arm_ik(targetpose, reference_frame="RShoulder"):
@@ -227,139 +248,6 @@ def on_pose(pose):
     else:
         rospy.loginfo("Got pose to look at, but I've fallen!");
 
-def on_backchannel(message):
-    pub_speech = rospy.Publisher("/speech", String, queue_size=5)
-    if (message.data == "start"):
-        msg = random.choice(["Ok","Sure","Umm?","Right","Yeah?"])
-    else:
-        msg = random.choice(["Here?","Yes?","Here I think","There?","Ok?"])
-    pub_speech.publish(String(msg))
-
-def get_answer(question):
-    if question == 1:
-        return "sur la chaise"
-    elif question == 2:
-        return "sous la chaise"
-    elif question == 3:
-        return "deh vaugn la chaise"
-    elif question == 4:
-        return "deh vaugn la chaise"
-    elif question == 5:
-        return "sous la chaise"
-    elif question == 6:
-        return "sur la chaise"
-    elif question == 7:
-        return "sur la chaise"
-    elif question == 8:
-        return "deh vaugn la chaise"
-    elif question == 9:
-        return "sous la chaise"
-    elif question == 10:
-        return "sur la chaise"
-    else:
-        return "je ne sais quoi"
-
-def on_answer(message):
-    global last_pose
-    messagestr = message.data
-    result,question = messagestr.split(',')
-    rospy.loginfo("Giving %s answer to quiz" % result)
-    answer = get_answer(int(question))
-    msg = answer
-    post_msg = "skip"
-    if result == "incorrect":
-        ans_list = ["sur la chaise", "sous la chaise", "deh vaugn la chaise"]
-        if answer in ans_list:
-            ans_list.remove(answer)
-        msg = random.choice(ans_list)
-        post_msg = random.choice(["That must have been wrong, but I am glad I tried.", "I guess I got it wrong, but that's ok.", "Hmm, a tricky one, but at least I had a go, "])
-        # if (int(question))%2 == 1:
-        #     pp_msg = random.choice(["now you get to have a go at this question", "looks like you can have an attempt now", "it's your turn to try."])
-        # else:
-        #     pp_msg = random.choice(["we were both wrong, but we will try hard on the next one!", "we both tried, lets see what the next question is.", "time to move onto the next question"])
-        #pp_msg = "time to move onto the next question"
-
-        #post_msg = post_msg + pp_msg
-
-    pub_speech = rospy.Publisher("/speech", String, queue_size=5)
-    AnmtdSpchProxy.say(msg)
-
-    if post_msg != "skip":
-        sleep(2) # Wait two seconds
-        AnmtdSpchProxy.say(post_msg)
-        
-    last_pose = rospy.Time.now()
-
-
-def on_quiz_feedback(message):
-    pub_speech = rospy.Publisher("/speech", String, queue_size=5)
-    if (message.data == "correct"):
-        msg = random.choice(["Well done %s!" % childname, "Good job!", "That's Great!"])
-    else:
-        msg = random.choice(["It was a good try at least.", "It is tricky, but good attempt.", "Good effort %s!" % childname, "That was not right, but good guess"])
-    pub_speech.publish(String(msg))
-
-def on_encourage(message):
-    pub_speech = rospy.Publisher("/speech", String, queue_size=5)
-    msg = random.choice(["You can do it! Give it a go.", "Just have a guess!", "If you don't try, you can't succeed.", "Don't worry %s, just have a go!" % childname])
-    AnmtdSpchProxy.say(msg)
-
-def start_prod_expl(message):
-    global state
-    global last_pose
-    state = "production"
-    
-    arm_to_rest_posture()
-
-    msg = "Ok %s , we are going to play my favourite game now. \pau=500\ It uses the words you were taught this morning! \pau=200\ " % childname
-    msg = msg + " This game is called, oo eh luh noo nours, or where is the teddy bear \pau=500\ ."
-    msg = msg + " Sounds fun, right? \pau=1500\ "
-    msg = msg + " On the screen in front of us we can see a noo nours with la chaise \pau=500\ ."
-    msg = msg + " Using the words we were taught this morning, sur, sous \pau=300\ and de vaugn, we need to say where luh noo nours is in relation to la chaise \pau=750\ !"
-    msg = msg + " We each score points based on the ones we get right \pau=500\ !"
-    msg = msg + " Your score is on the left, mine is on the right \pau=500\ ."
-    msg = msg + " I'll try the first one to show you how it works."
-    msg = "\RSPD=90\ \VCT=100\ " + msg
-
-    AnmtdSpchProxy.say(msg)
-
-    if ((not trackerProxy.isActive()) and(state != "waiting")):
-                trackerProxy.lookAt([1,0,.2], 0, .1,False)
-                trackerProxy.registerTarget("Face",.2)
-                trackerProxy.track("Face")
-                
-    last_pose = rospy.Time.now()
-
-def on_message(message):
-    global last_pose
-    messagestr = message.data
-    animated,msg = messagestr.split(',') #"animated,what was that in french?"
-    if (animated == "animated"):
-        AnmtdSpchProxy.say(msg)
-    else:
-        pub_speech = rospy.Publisher("/speech", String, queue_size=5)
-        pub_speech.publish(String(msg))
-        
-    last_pose = rospy.Time.now()
-
-def on_childname(message):
-    global childname
-    childname = message.data
-
-def start_placement(message):
-    global state
-    state = "placement"
-    
-    msg = "Hello %s . \pau=300\ " % childname
-    msg = msg + "I am Chapman, I am really excited to play this game with you today. \pau=500\ "
-    msg = msg + "Right, \pau=250\ why don't we start with one of the animals"
-
-    msg = "\RSPD=90\ \VCT=100\ " + msg
-
-    AnmtdSpchProxy.say(msg)
-    postureProxy.goToPosture("StandInit", 0.5)
-    set_pointing_posture()
-
 class FallResponder(ALModule):
   """ Module to react to robotHasFallen events """
 
@@ -374,13 +262,129 @@ class FallResponder(ALModule):
       self.motionProxy.killAll();
       rospy.loginfo("Stopped task");
 
-if __name__ == "__main__":
+def set_condition(message):
+    global order
+    global cond1
+    global cond2
+    
+    conditions = message.data
+    
+    order, cond1, cond2 = conditions.split('-')
 
+def na_description(cur_map, targ):
+    
+    global new_desc
+    
+    msg = na_desc[cur_map][targ]
+    
+    targetpose = PoseStamped()        
+    targetpose.header.frame_id = str(cur_map + 1) + "_" + str(targ + 1) + "_target"
+    targetpose.header.stamp = rospy.Time(0)
+    
+    look_at(targetpose)
+    
+    pub_rob_start.publish()
+    say_id = textSpchProxy.post.say(msg)
+    textSpchProxy.wait(say_id, 0)
+    
+    trackerProxy.lookAt([1,0,0.6], 0, .1,False)
+    
+    pub_rob_end.publish()
+    
+    new_desc = False
+    
+    return rospy.Time.now()
+    
+      
+def command(message):
+    
+    global order
+    global cond1
+    global cond2
+    global cur_targ
+    global state
+    global cur_map
+    global new_desc
+    
+    if message.data == "tutorial":
+        
+        trackerProxy.lookAt([1,0,0.6], 0, .1,False)
+        trackerProxy.registerTarget("Face",.2)
+        trackerProxy.track("Face")
+    
+        msg = "Hello. "
+        msg = msg + "I am Pico, today we are going to play a game together. \pau=500\ "
+        msg = msg + "In a moment we are going to see the map of a city. \pau=500\ "
+        msg = msg + "However some of the buildings from the city are missing. \pau=500\ "
+        msg = msg + "You will see some buildings pop up with a red border, you can move them around by touching the screen. \pau=500\ "
+        msg = msg + "I will be describing where these buildings should go. \pau=500\ "
+        msg = msg + "In front of you right now you can see the names I will be using to describe the buildings that need to be moved, and that are already in position. \pau=500\ "
+        msg = msg + "A church, a commercial district, a factory, a fire department, a hospital, a manor, a police department, a power plant, and a residence. \pau=500\ "
+        msg = msg + "Let's get started!"
+
+        msg = "\RSPD=90\ \VCT=100\ " + msg
+
+        say_id = textSpchProxy.post.say(msg)
+        textSpchProxy.wait(say_id, 0)
+        
+        pub_start_placement1.publish()
+        
+    elif message.data == "placement1":
+        
+        cur_map = int(order)
+    
+        if cond1 == "B":
+            pass
+        else:
+            state = "na_describe"
+    
+    elif message.data == "placement2":
+        
+        cur_map = 1 - int(order)
+            
+        if cond2 == "B":
+            pass
+        else:
+            state = "na_describe"
+            
+    elif message.data == "success":
+        
+        prev_state = state
+        state = "success"
+        say_id = textSpchProxy.post.say("Well done!")
+        textSpchProxy.wait(say_id, 0)
+        cur_targ = cur_targ + 1
+        if cur_targ < 7:
+            state = prev_state
+            new_desc = True
+        else:
+            state = "idle"
+            cur_targ = 0
+        
+    else:
+        textSpchProxy.post.say("I am afraid I can't do that Dave")
+        
+    #postureProxy.goToPosture("Crouch", 0.5)
+    #set_pointing_posture()
+
+if __name__ == "__main__":
+    global state
+    global ctx
+    global target
+    global na_desc
+    global cur_targ
+    global cur_map
+    global new_desc
+    
+    na_desc = [[]]
+    new_desc = True
+    
     rospy.init_node("nao_behaviours");
 
+    last_desc = rospy.Time.now()
+
     POSES_TOPIC = rospy.get_param('~poses_output_topic','poses')
-    NAO_IP = rospy.get_param('~nao_ip','127.0.0.1'); #default behaviour is
-                                        #to connect to simulator locally
+    NAO_IP = rospy.get_param('~nao_ip','192.168.1.112'); 
     NAO_HANDEDNESS = rospy.get_param('~nao_handedness','right')
     if(NAO_HANDEDNESS.lower()=='right'):
         effector   = "RArm"
@@ -390,17 +394,18 @@ if __name__ == "__main__":
         rospy.logerr('error in handedness param')
 
     pub_speech = rospy.Publisher("/speech", String, queue_size=5)
-    sub_backchannel = rospy.Subscriber("nao/backchannel/standard", String, on_backchannel, queue_size=1)
-    sub_quiz_answer = rospy.Subscriber("nao/prod_quiz/answer", String, on_answer, queue_size=1)
-    sub_quiz_feedback = rospy.Subscriber("nao/prod_quiz/feedback", String, on_quiz_feedback, queue_size=1)
-    sub_quiz_encourage = rospy.Subscriber("nao/prod_quiz/encourage", Empty, on_encourage, queue_size=1)
-    sub_quiz_start = rospy.Subscriber("nao/prod_quiz/start", Empty, start_prod_expl, queue_size=1)
-    sub_quiz_msg = rospy.Subscriber("nao/prod_quiz/message", String, on_message, queue_size=1)
-    sub_quiz_childname = rospy.Subscriber("nao/prod_quiz/childname", String, on_childname, queue_size=1)
-    sub_placement_start = rospy.Subscriber("nao/placement/start", Empty, start_placement, queue_size=1)
-
-    global childname
-    childname = ""
+    #sub_backchannel = rospy.Subscriber("nao/backchannel/standard", String, on_backchannel, queue_size=1)
+    #sub_quiz_answer = rospy.Subscriber("nao/prod_quiz/answer", String, on_answer, queue_size=1)
+    #sub_quiz_feedback = rospy.Subscriber("nao/prod_quiz/feedback", String, on_quiz_feedback, queue_size=1)
+    #sub_quiz_encourage = rospy.Subscriber("nao/prod_quiz/encourage", Empty, on_encourage, queue_size=1)
+    #sub_quiz_start = rospy.Subscriber("nao/prod_quiz/start", Empty, start_prod_expl, queue_size=1)
+    #sub_quiz_msg = rospy.Subscriber("nao/prod_quiz/message", String, on_message, queue_size=1)
+    #sub_quiz_childname = rospy.Subscriber("nao/prod_quiz/childname", String, on_childname, queue_size=1)
+    sub_placement_start = rospy.Subscriber("nao/place_desc/command", String, command, queue_size=1)
+    sub_placement_condition = rospy.Subscriber("nao/place_desc/condition", String, set_condition, queue_size=1)
+    pub_start_placement1 = rospy.Publisher("/sandtray/signals/start_placement1", Empty, queue_size=1)
+    pub_rob_start = rospy.Publisher("/sandtray/signals/rob_speech_start", Empty, queue_size=1)
+    pub_rob_end = rospy.Publisher("/sandtray/signals/rob_speech_end", Empty, queue_size=1)
 
     # We need this broker to be able to construct
     # NAOqi modules and subscribe to other modules
@@ -417,17 +422,82 @@ if __name__ == "__main__":
     postureProxy = ALProxy("ALRobotPosture", NAO_IP, port);
     trackerProxy = ALProxy("ALTracker", NAO_IP, port);
     AnmtdSpchProxy = ALProxy("ALAnimatedSpeech", NAO_IP, port);
+    textSpchProxy = ALProxy("ALTextToSpeech", NAO_IP, port)
     #fallResponder = FallResponder("fallResponder",motionProxy,memoryProxy);
 
-    global state
     state = "waiting"
     
     if trackerProxy.isActive():
         trackerProxy.stopTracker()
 
+    world1 = ctx.worlds["map1"]
+    world2 = ctx.worlds["map2"]
+    
+    ModelLoader().load("res/map_wEmpty.blend", world="map1")
+    ModelLoader().load("res/map2_wEmpty.blend", world="map2")
+    
+    time.sleep(5) # leave some time for the loader to finish
+    
+    target[0][0] = world1.scene.nodebyname("residence-18")[0].id
+    target[0][1] = world1.scene.nodebyname("manor")[0].id
+    target[0][2] = world1.scene.nodebyname("residence-7")[0].id
+    target[0][3] = world1.scene.nodebyname("commercial_district-1")[0].id
+    target[0][4] = world1.scene.nodebyname("police_department")[0].id
+    target[0][5] = world1.scene.nodebyname("police_department-1")[0].id
+    target[0][6] = world1.scene.nodebyname("church-2")[0].id
+    target[1][0] = world2.scene.nodebyname("hospital-1")[0].id
+    target[1][1] = world2.scene.nodebyname("hospital-2")[0].id
+    target[1][2] = world2.scene.nodebyname("residence-6")[0].id
+    target[1][3] = world2.scene.nodebyname("hospital")[0].id
+    target[1][4] = world2.scene.nodebyname("residence-17")[0].id
+    target[1][5] = world2.scene.nodebyname("manor-1")[0].id
+    target[1][6] = world2.scene.nodebyname("power_plant")[0].id
+    
+    for node in world1.scene.nodes:
+        format_name("map1", node.id)
+    
+    for node in world2.scene.nodes:
+        format_name("map2", node.id)
+        
+    time.sleep(10)
+    
+    i = 0
+    j = 0
+    
+    
+    
+    while i < 2:
+        if i == 0:
+            worldname = "map1"
+        else:
+            worldname = "map2"
+            na_desc.append([])
+           
+        world = ctx.worlds[worldname]
+        
+        target_chk = target[i]
+        
+        node_chk = []
+        
+        for node_id in target_chk:
+            node_chk.append(world.scene.nodes[node_id])
+        
+        while j < 7:
+            node_chk.pop(0)
+            desc = gen_spatial_desc(ctx, worldname, target[i][j], "default", node_chk,"en_GB","NonAmbig", "placement", True)
+            na_desc[i].append(str(desc))
+            j = j+1
+            
+        j = 0
+        i = i + 1
+
     motionProxy.wbEnableEffectorControl(effector,False); #if robot has fallen it will have a hard time getting up if the effector is still trying to be kept in a particular position
     motionProxy.wakeUp()
-    postureProxy.goToPosture("StandInit", 0.5)
+    post_id = postureProxy.post.goToPosture("Crouch", 0.5)
+    postureProxy.wait(post_id,0)
+    names = ['RKneePitch', 'LKneePitch', 'RAnklePitch', 'LAnklePitch', 'RAnkleRoll', 'LAnkleRoll']
+    motionProxy.setStiffnesses(names, 0.0)
+    motionProxy.setBreathEnabled("Arms", True)
 
     #global state
     #state = "placement"
@@ -444,12 +514,14 @@ if __name__ == "__main__":
             t = tl.getLatestCommonTime("odom", "sandtray")
             if tl.canTransform("odom", "sandtray",t):
                 rospy.loginfo("Ok! Starting robot behaviours.")
-                pub_speech.publish(String("Ready to go!"))
+                #textSpchProxy.say(String("Ready to go!"))
                 break
             else:
-                rospy.logwarn("No transform robot->sandtray. Robot not yet localised!")
+                pass
+                #rospy.logwarn("No transform robot->sandtray. Robot not yet localised!")
         except:
-            rospy.logwarn("No transform robot->sandtray. Robot not yet localised!")
+            pass
+            #rospy.logwarn("No transform robot->sandtray. Robot not yet localised!")
 
         rospy.sleep(0.5)
 
@@ -466,33 +538,48 @@ if __name__ == "__main__":
                 robot_focus = PoseStamped()
                 robot_focus.header.stamp = rospy.Time.now()
                 robot_focus.header.frame_id = "robot_focus"
-                if not robot_ready_to_point:
-                    set_pointing_posture()
-                else:
-                    point_at(robot_focus)
-                    look_at(robot_focus)
+                #if not robot_ready_to_point:
+                    #set_pointing_posture()
+                    #pass
+                #else:
+                    #point_at(robot_focus)
+                    #look_at(robot_focus)
             else:
                 is_tracking_focus = False
         except Exception as e: # most likely, robot_focus is not published. That's ok, don't track it then
             is_tracking_focus = False
             pass
 
+        #point_at((0,0,0))
 
-        if last_pose and (rospy.Time.now() - last_pose).to_sec() > 5:
+        #if last_pose and (rospy.Time.now() - last_pose).to_sec() > 5:
             #if (rospy.Time.now() - last_pose).to_sec() < 30:
-            if state == "placement":
-                arm_between_pointing_posture()
+            #if state == "placement":
+                #arm_between_pointing_posture()
             #else:
                 #postureProxy.goToPosture("StandInit", 0.5)
             #else:
                 #arm_to_rest_posture()
 
-        if last_pose and (rospy.Time.now() - last_pose).to_sec() > 1:
-            if ((not trackerProxy.isActive()) and(state != "waiting")):
-                trackerProxy.lookAt([1,0,.2], 0, .1,False)
-                trackerProxy.registerTarget("Face",.2)
-                trackerProxy.track("Face")
-
+        #if last_pose and (rospy.Time.now() - last_pose).to_sec() > 1:
+            #if ((not trackerProxy.isActive()) and(state != "waiting")):
+                #trackerProxy.lookAt([1,0,.2], 0, .1,False)
+                #trackerProxy.registerTarget("Face",.2)
+                #trackerProxy.track("Face")
+                
+        if state == "na_describe" and (((rospy.Time.now() - last_desc).to_sec() > 5) or (new_desc == True)):
+            last_desc = na_description(cur_map, cur_targ)
+        
+        #elif cur_targ == 1:
+            #targetpose = PoseStamped()        
+            #targetpose.header.frame_id = "1_2_manor"
+            #targetpose.header.stamp = rospy.Time(0)
+    
+            #look_at(targetpose)
+        else:
+            #trackerProxy.lookAt([1,0,0.6], 0, .1,False)
+            trackerProxy.registerTarget("Face",.2)
+            trackerProxy.track("Face")
 
         r.sleep()
 
