@@ -28,6 +28,10 @@ from underworlds.tools.loader import ModelLoader
 from underworlds.tools.spatial_relations import *
 from underworlds.tools.edit import *
 
+import csv
+from sklearn.svm import SVC
+from sklearn.metrics import confusion_matrix
+
 from placement_description import *
 
 TO_RAD = math.pi / 180
@@ -59,13 +63,21 @@ ctx = underworlds.Context("Nao Description")
 
 target = numpy.empty((2,7), dtype="a36")
 na_desc = [[]]
+obj_frame_id = [[]]
 
 order = 0
 cond1 = "N"
-cond2 = "A"
+cond2 = "D"
 cur_targ = 0
 cur_map = 0
 new_desc = True
+cur_targ_frame = "1_1_target"
+cur_obj_id = ""
+d_rel_list = []
+iteration = 0
+full_desc = ""
+
+target_change = False
 
 def clamp(v, limits):
     vmin, vmax = limits
@@ -262,6 +274,49 @@ class FallResponder(ALModule):
       self.motionProxy.killAll();
       rospy.loginfo("Stopped task");
 
+def build_classifier():
+    
+    train = []
+    trainresult = []
+    test = []
+    testresult = []
+    
+    with open('res/train.csv', 'rb') as csvfile:
+    
+        trainreader = csv.reader(csvfile, delimiter = ',', quotechar ='|')
+        
+        for row in trainreader:
+            
+            if train == []:
+                train = numpy.append(train, [row[0], row[1], row[2], row[3]])
+            else:
+                train = numpy.vstack((train, [row[0], row[1], row[2], row[3]]))
+            
+            trainresult = numpy.append(trainresult, [row[4]])
+
+        clf = SVC(gamma='auto', kernel='rbf')
+        clf.fit(train, trainresult) 
+    
+    with open('res/test.csv', 'rb') as csvtestfile:
+        
+        testreader = csv.reader(csvtestfile, delimiter = ',', quotechar ='|')
+        
+        for row in testreader:
+            
+            if test == []:
+                test = numpy.append(test, [row[0], row[1], row[2], row[3]])
+            else:
+                test = numpy.vstack((test, [row[0], row[1], row[2], row[3]]))
+            
+            testresult = numpy.append(testresult, [row[4]])
+
+        print(clf.score(test, testresult))
+        predresult = clf.predict(test)
+        
+        print confusion_matrix(testresult, predresult)
+        
+    return clf
+
 def set_condition(message):
     global order
     global cond1
@@ -274,6 +329,7 @@ def set_condition(message):
 def na_description(cur_map, targ):
     
     global new_desc
+    new_desc = False
     
     msg = na_desc[cur_map][targ]
     
@@ -291,11 +347,64 @@ def na_description(cur_map, targ):
     
     pub_rob_end.publish()
     
-    new_desc = False
+    return rospy.Time.now()
+   
+def d_description(node_id, decision):
+
+    global new_desc
+    global d_rel_list
+    global cur_map
+    global ctx
+    global iteration
+    global full_desc
+    global cur_targ
+    global state
+    
+    #state = "wait"
+    
+    if cur_map == 0:
+        worldName = "map1"
+    else:
+        worldName = "map2"
+    
+    if new_desc == True:
+        
+        new_desc = False
+        desc, d_rel_list = dynamic_desc(ctx, worldName, [], node_id, 0, "initial", "default", "en_GB", True)
+        full_desc = desc
+        iteration = 1
+        
+    elif decision == "elaborate":
+        if iteration < 4:
+            desc, d_rel_list = dynamic_desc(ctx, worldName, d_rel_list, node_id, iteration, decision, "default", "en_GB", True)
+            iteration = iteration + 1
+            full_desc = full_desc + ', ' + desc
+        else:
+            desc = full_desc
+            
+    else:
+        desc, d_rel_list = dynamic_desc(ctx, worldName, d_rel_list, node_id, iteration, decision, "default", "en_GB", True)
+    
+    print desc
+    
+    targetpose = PoseStamped()        
+    targetpose.header.frame_id = str(cur_map + 1) + "_" + str(cur_targ + 1) + "_target"
+    targetpose.header.stamp = rospy.Time(0)
+    
+    look_at(targetpose)
+    
+    pub_rob_start.publish()
+    say_id = textSpchProxy.post.say(str(desc))
+    textSpchProxy.wait(say_id, 0)
+    
+    trackerProxy.lookAt([1,0,0.6], 0, .1,False)
+    
+    pub_rob_end.publish()
+    
+    #state = "d_describe"
     
     return rospy.Time.now()
     
-      
 def command(message):
     
     global order
@@ -305,6 +414,7 @@ def command(message):
     global state
     global cur_map
     global new_desc
+    global cur_targ_frame
     
     if message.data == "tutorial":
         
@@ -332,18 +442,22 @@ def command(message):
     elif message.data == "placement1":
         
         cur_map = int(order)
+        cur_targ_frame = str(cur_map + 1) + "_" + str(cur_targ + 1) + "_target"
+        new_desc = True
     
-        if cond1 == "B":
-            pass
+        if cond1 == "D":
+            state = "d_describe"
         else:
             state = "na_describe"
     
     elif message.data == "placement2":
         
         cur_map = 1 - int(order)
+        cur_targ_frame = str(cur_map + 1) + "_" + str(cur_targ + 1) + "_target"
+        new_desc = True
             
-        if cond2 == "B":
-            pass
+        if cond2 == "D":
+            state = "d_describe"
         else:
             state = "na_describe"
             
@@ -354,12 +468,16 @@ def command(message):
         say_id = textSpchProxy.post.say("Well done!")
         textSpchProxy.wait(say_id, 0)
         cur_targ = cur_targ + 1
+        cur_targ_frame = str(cur_map + 1) + "_" + str(cur_targ + 1) + "_target"
+        
         if cur_targ < 7:
             state = prev_state
             new_desc = True
         else:
             state = "idle"
             cur_targ = 0
+        
+        #print cur_targ_frame
         
     else:
         textSpchProxy.post.say("I am afraid I can't do that Dave")
@@ -375,9 +493,16 @@ if __name__ == "__main__":
     global cur_targ
     global cur_map
     global new_desc
+    global cur_targ_frame
+    global cur_obj_id
     
     na_desc = [[]]
     new_desc = True
+    
+    prev_x = 0
+    prev_y = 0
+    prev_z = 0
+    previous_vector = numpy.array([0,0,0])
     
     rospy.init_node("nao_behaviours");
 
@@ -394,13 +519,6 @@ if __name__ == "__main__":
         rospy.logerr('error in handedness param')
 
     pub_speech = rospy.Publisher("/speech", String, queue_size=5)
-    #sub_backchannel = rospy.Subscriber("nao/backchannel/standard", String, on_backchannel, queue_size=1)
-    #sub_quiz_answer = rospy.Subscriber("nao/prod_quiz/answer", String, on_answer, queue_size=1)
-    #sub_quiz_feedback = rospy.Subscriber("nao/prod_quiz/feedback", String, on_quiz_feedback, queue_size=1)
-    #sub_quiz_encourage = rospy.Subscriber("nao/prod_quiz/encourage", Empty, on_encourage, queue_size=1)
-    #sub_quiz_start = rospy.Subscriber("nao/prod_quiz/start", Empty, start_prod_expl, queue_size=1)
-    #sub_quiz_msg = rospy.Subscriber("nao/prod_quiz/message", String, on_message, queue_size=1)
-    #sub_quiz_childname = rospy.Subscriber("nao/prod_quiz/childname", String, on_childname, queue_size=1)
     sub_placement_start = rospy.Subscriber("nao/place_desc/command", String, command, queue_size=1)
     sub_placement_condition = rospy.Subscriber("nao/place_desc/condition", String, set_condition, queue_size=1)
     pub_start_placement1 = rospy.Publisher("/sandtray/signals/start_placement1", Empty, queue_size=1)
@@ -426,6 +544,8 @@ if __name__ == "__main__":
     #fallResponder = FallResponder("fallResponder",motionProxy,memoryProxy);
 
     state = "waiting"
+    
+    clf = build_classifier()
     
     if trackerProxy.isActive():
         trackerProxy.stopTracker()
@@ -453,6 +573,22 @@ if __name__ == "__main__":
     target[1][5] = world2.scene.nodebyname("manor-1")[0].id
     target[1][6] = world2.scene.nodebyname("power_plant")[0].id
     
+    obj_frame_id[0].append("1_1_residential")
+    obj_frame_id[0].append("1_2_manor")
+    obj_frame_id[0].append("1_3_residential")
+    obj_frame_id[0].append("1_4_commercial")
+    obj_frame_id[0].append("1_5_police")
+    obj_frame_id[0].append("1_6_police")
+    obj_frame_id[0].append("1_7_church")
+    obj_frame_id.append([])
+    obj_frame_id[1].append("2_1_hospital")
+    obj_frame_id[1].append("2_2_hospital")
+    obj_frame_id[1].append("2_3_residential")
+    obj_frame_id[1].append("2_4_hospital")
+    obj_frame_id[1].append("2_5_residential")
+    obj_frame_id[1].append("2_6_manor")
+    obj_frame_id[1].append("2_7_power")
+    
     for node in world1.scene.nodes:
         format_name("map1", node.id)
     
@@ -463,8 +599,6 @@ if __name__ == "__main__":
     
     i = 0
     j = 0
-    
-    
     
     while i < 2:
         if i == 0:
@@ -499,17 +633,11 @@ if __name__ == "__main__":
     motionProxy.setStiffnesses(names, 0.0)
     motionProxy.setBreathEnabled("Arms", True)
 
-    #global state
-    #state = "placement"
-    #set_pointing_posture()
-
     tl = tf.TransformListener()
 
     ### Check the robot is launched and properly localised wrt the sandtray
     while not rospy.is_shutdown() and state != "placement":
-        #if not tl.frameExists("/odom"):
-        #    rospy.logwarn("Waiting for frame /odom to be published...")
-        #else:
+
         try:
             t = tl.getLatestCommonTime("odom", "sandtray")
             if tl.canTransform("odom", "sandtray",t):
@@ -527,10 +655,15 @@ if __name__ == "__main__":
 
     sub_poses = rospy.Subscriber(POSES_TOPIC, PoseStamped, on_pose, queue_size=1) # queue_size = 1 to discard all but the most recent pose -- otherwise, tracking would possibly lag
 
-    r = rospy.Rate(2)
-
+    r = rospy.Rate(10)
+    
+    decision_list = []
+    
+    targ_found = False
+    new_desc = False
 
     while not rospy.is_shutdown():
+        
         try:
             t = tl.getLatestCommonTime(HEAD_FRAME, "robot_focus")
             if tl.canTransform(HEAD_FRAME, "robot_focus",t):
@@ -538,44 +671,140 @@ if __name__ == "__main__":
                 robot_focus = PoseStamped()
                 robot_focus.header.stamp = rospy.Time.now()
                 robot_focus.header.frame_id = "robot_focus"
-                #if not robot_ready_to_point:
-                    #set_pointing_posture()
-                    #pass
-                #else:
-                    #point_at(robot_focus)
-                    #look_at(robot_focus)
             else:
                 is_tracking_focus = False
         except Exception as e: # most likely, robot_focus is not published. That's ok, don't track it then
             is_tracking_focus = False
             pass
 
-        #point_at((0,0,0))
-
-        #if last_pose and (rospy.Time.now() - last_pose).to_sec() > 5:
-            #if (rospy.Time.now() - last_pose).to_sec() < 30:
-            #if state == "placement":
-                #arm_between_pointing_posture()
-            #else:
-                #postureProxy.goToPosture("StandInit", 0.5)
-            #else:
-                #arm_to_rest_posture()
-
-        #if last_pose and (rospy.Time.now() - last_pose).to_sec() > 1:
-            #if ((not trackerProxy.isActive()) and(state != "waiting")):
-                #trackerProxy.lookAt([1,0,.2], 0, .1,False)
-                #trackerProxy.registerTarget("Face",.2)
-                #trackerProxy.track("Face")
                 
         if state == "na_describe" and (((rospy.Time.now() - last_desc).to_sec() > 5) or (new_desc == True)):
             last_desc = na_description(cur_map, cur_targ)
+        
+        
+        if state == "d_describe":
+            
+            if new_desc == True:
+            
+                targ_found = False
+                
+                prev_x = 0
+                prev_y = 0
+                prev_z = 0
+                previous_vector = numpy.array([0,0,0])
+                
+                cur_obj_id = target[cur_map][cur_targ]
+                
+                try:
+                    (trans, rot) = tl.lookupTransform(cur_targ_frame, '/sandtray', rospy.Time(0))
+                    #Convert for classifier
+                    target_x = trans[0] * 15
+                    target_y = trans[1] * 15
+                    target_z = trans[2] * 15
+                    
+                    targ_found = True
+                    
+                except Exception as e:
+                    print "exception in targ_frame"
+                    print e
+                    pass
+            
+            try:
+
+                (trans, rot) = tl.lookupTransform(obj_frame_id[cur_map][cur_targ], '/sandtray', rospy.Time(0))
+                #Convert for classifier
+                cur_x = trans[0] * 15
+                cur_y = trans[1] * 15
+                cur_z = trans[2] * 15
+                
+                x_vec = cur_x - prev_x
+                y_vec = cur_y - prev_y
+                z_vec = cur_z - prev_z
+                
+                vector = numpy.array([x_vec,y_vec,z_vec])
+                mag = numpy.linalg.norm(vector)
+                
+                x_dist = target_x - cur_x
+                y_dist = target_y - cur_y
+                z_dist = target_z - cur_z
+                
+                x_prev_dist = target_x - prev_x
+                y_prev_dist = target_y - prev_y
+                z_prev_dist = target_z - prev_z
+                
+                dist_vec = numpy.array([x_dist,y_dist,z_dist])
+                distance_to_target = numpy.linalg.norm(dist_vec)
+                
+                prev_dist_vec = numpy.array([x_prev_dist,y_prev_dist,z_prev_dist])
+                prev_distance_to_target = numpy.linalg.norm(prev_dist_vec)
+                
+                change_in_dist = distance_to_target - prev_distance_to_target
+                
+                prev_mag = numpy.linalg.norm(previous_vector)
+                
+                if mag == 0 or prev_mag == 0:
+                    angle_from_prev = 0
+                else:
+                    unit_vector_1 = vector/mag
+                    unit_vector_2 = previous_vector/prev_mag
+                    angle_from_prev = numpy.arccos(numpy.clip(numpy.dot(unit_vector_1, unit_vector_2), -1.0, 1.0))
+                
+                prev_x = cur_x
+                prev_y = cur_y
+                prev_z = cur_z
+                
+                previous_vector = vector
+                
+                pred_data = numpy.array([distance_to_target, change_in_dist, mag, angle_from_prev])
+                
+                shaped_data = pred_data.reshape(1,-1)
+                
+                decision = clf.predict(shaped_data)
+                
+                decision_list.append(int(decision[0]))
+                
+                if len(decision_list) > 5:
+                    decision_list.pop(0)
+                
+                #print decision
+            
+            except Exception as e:
+                print "exception in obj_frame"
+                print e
+                pass
+                
+            time_since_last = (rospy.Time.now() - last_desc).to_sec()
+            
+            if time_since_last > 0.5 or new_desc == True:
+                if new_desc == True:
+                    final_dec = "initial"
+                elif len(decision_list) == 0:
+                    final_dec = "elaborate"
+                else:
+                    print decision_list
+                    avg_decision = float(sum(decision_list))/float(len(decision_list))
+                    print avg_decision
+                    if avg_decision < 0.8:
+                        final_dec = "negate"
+                    elif avg_decision > 1.5:
+                        final_dec = "positive"
+                    else:
+                        final_dec = "elaborate"
+                        
+                if (final_dec == "initial") or (final_dec  == "negate") or (final_dec == "elaborate" and time_since_last >= 1) or (final_dec == "positive" and time_since_last >= 2):
+                    last_desc = d_description(cur_obj_id, final_dec)
+                else:
+                    trackerProxy.registerTarget("Face",.2)
+                    trackerProxy.track("Face")
         
         #elif cur_targ == 1:
             #targetpose = PoseStamped()        
             #targetpose.header.frame_id = "1_2_manor"
             #targetpose.header.stamp = rospy.Time(0)
-    
             #look_at(targetpose)
+            
+        elif state == "wait":
+            pass
         else:
             #trackerProxy.lookAt([1,0,0.6], 0, .1,False)
             trackerProxy.registerTarget("Face",.2)
